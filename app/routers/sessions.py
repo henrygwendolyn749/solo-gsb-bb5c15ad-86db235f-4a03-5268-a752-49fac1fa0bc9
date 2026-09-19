@@ -1,15 +1,17 @@
-"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史。"""
+"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 请求预演。"""
 from __future__ import annotations
 
 import json
 import secrets
 import sqlite3
+from typing import Any
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..db import dumps, get_conn, write_tx
+from ..engine import SimAbort, preview_session
 from ..store import store
 
 router = APIRouter(prefix="/__sessions", tags=["sessions"])
@@ -121,6 +123,91 @@ async def list_events(token: str, limit: int = 50) -> JSONResponse:
 class ResetBody(BaseModel):
     state: str | None = None
     context: dict | None = None
+
+
+_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+
+class PreviewBody(BaseModel):
+    method: str | None = Field(default=None, description="HTTP 方法，默认 GET")
+    path: str = Field(description="业务路径，如 /orders/42/pay（不含 query）")
+    query: dict | None = Field(default=None, description="查询参数（多值取最后一个）")
+    headers: dict | None = Field(default=None, description="请求头，键名会归一化为小写")
+    body: Any = Field(default=None, description="请求体；与真实 JSON 请求一致，缺省视为空对象 {}")
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.startswith("/"):
+            raise ValueError("path 必须是以 / 开头的字符串")
+        return value
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, value: str | None) -> str | None:
+        if value is not None:
+            value = value.upper()
+            if value not in _ALLOWED_METHODS:
+                raise ValueError(f"不支持的 HTTP 方法: {value}")
+        return value
+
+    @field_validator("headers")
+    @classmethod
+    def _validate_headers(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        if not all(isinstance(k, str) for k in value):
+            raise ValueError("headers 的键必须是字符串")
+        return {k.lower(): _stringify(v) for k, v in value.items()}
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query(cls, value: dict | None) -> dict | None:
+        if value is None:
+            return None
+        if not all(isinstance(k, str) for k in value):
+            raise ValueError("query 的键必须是字符串")
+        return {k: _stringify(v) for k, v in value.items()}
+
+
+def _stringify(value: Any) -> str:
+    """真实 query/header 的值都是字符串；dict/list 退化为 JSON 文本。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return str(value)
+
+
+@router.post("/{token}/preview")
+async def preview_request(token: str, body: PreviewBody) -> JSONResponse:
+    """**请求预演**：基于当前会话快照复用真实匹配/渲染逻辑，返回拟响应与差异，不落库。"""
+    method = body.method or "GET"
+    query = body.query or {}
+    headers = body.headers or {}
+    req_body = body.body if body.body is not None else {}
+
+    try:
+        status_code, payload = preview_session(
+            token=token,
+            method=method,
+            path=body.path,
+            query=query,
+            headers=headers,
+            body=req_body,
+            default_scenario=None,
+        )
+    except SimAbort as exc:
+        # 与真实请求一致的状态码和错误详情（404 无路由 / 405 方法不允许 /
+        # 410 场景已卸载 / 500 渲染错误等），并附判定轨迹
+        payload = dict(exc.body)
+        if exc.trace is not None:
+            payload["trace"] = exc.trace
+        payload["preview"] = {"persisted": False}
+        status_code = exc.status_code
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.post("/{token}/reset")

@@ -94,6 +94,21 @@ class WriteLocked(sqlite3.OperationalError):
 
 
 @contextmanager
+def read_tx() -> Iterator[sqlite3.Connection]:
+    """打开一个只读快照事务，退出时始终回滚。
+
+    供请求预演使用：块内绝不应发起写操作；即使误写或抛出
+    ``commit_on_abort`` 异常，回滚也保证不产生任何持久化副作用。
+    """
+    conn = get_conn()
+    conn.execute("BEGIN")  # 延迟事务：首次读时建立一致性快照，不获取写锁
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+
+
+@contextmanager
 def write_tx(retries: int | None = None) -> Iterator[sqlite3.Connection]:
     """打开一个 IMMEDIATE 写事务，锁冲突时重试。
 

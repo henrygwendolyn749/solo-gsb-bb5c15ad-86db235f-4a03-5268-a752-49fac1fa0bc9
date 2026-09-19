@@ -40,9 +40,12 @@ def _choice(values: list[Any]) -> Any:
 class Renderer:
     """每个请求一个实例：携带 seq 计数器与完整上下文。"""
 
-    def __init__(self, context: dict[str, Any]):
+    def __init__(self, context: dict[str, Any], *, trace_calls: bool = False):
         self.context = dict(context)
         self.counters: dict[str, int] = dict(self.context.get("_seq") or {})
+        # 预演时记录本次渲染中 seq() 的调用轨迹（计数器仍只存在于本实例内存中）
+        self.trace_calls = trace_calls
+        self.seq_calls: list[dict[str, Any]] = []
 
         self.env = SandboxedEnvironment(
             undefined=StrictUndefined,
@@ -59,10 +62,18 @@ class Renderer:
         )
 
     def _seq(self, name: str = "default", start: int = 1) -> int:
-        if name not in self.counters:
+        existed = name in self.counters
+        if not existed:
             self.counters[name] = start
         value = self.counters[name]
         self.counters[name] += 1
+        if self.trace_calls:
+            self.seq_calls.append({
+                "name": name,
+                "start": start,
+                "value": value,
+                "existed": existed,
+            })
         return value
 
     # -- 公开方法 --------------------------------------------------------

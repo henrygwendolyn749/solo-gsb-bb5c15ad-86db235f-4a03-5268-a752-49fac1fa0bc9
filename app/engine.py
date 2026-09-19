@@ -1,4 +1,10 @@
-"""核心模拟引擎：在单个 IMMEDIATE 事务中完成匹配、渲染、状态推进。"""
+"""核心模拟引擎：在单个 IMMEDIATE 事务中完成匹配、渲染、状态推进。
+
+同一会话快照还支持**预演**（``preview_session``）：在只读事务中复用
+路由匹配、条件判定与模板渲染的同一份代码，产出拟响应与 state/context
+差异，但全程回滚、不写任何表；即使模板调用 ``seq()``，计数器也只在
+一次性的渲染器实例内自增，随后的真实请求仍看到预演前的值。
+"""
 from __future__ import annotations
 
 import json
@@ -7,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .db import dumps, write_tx
+from .db import dumps, read_tx, write_tx
 from .matching import evaluate_condition, get_condition_value, match_path
 from .models import Route, Rule, Scenario
 from .renderer import RenderError, Renderer
@@ -17,11 +23,13 @@ from .store import store
 class SimAbort(Exception):
     """以指定 HTTP 响应终止；commit_on_abort=True 时提交事务。"""
 
-    def __init__(self, status_code: int, body: Any, *, commit_on_abort: bool = False):
+    def __init__(self, status_code: int, body: Any, *, commit_on_abort: bool = False,
+                 trace: list[dict[str, Any]] | None = None):
         super().__init__(json.dumps(body, ensure_ascii=False))
         self.status_code = status_code
         self.body = body
         self.commit_on_abort = commit_on_abort
+        self.trace = trace
 
 
 @dataclass
@@ -83,33 +91,104 @@ def _select_scenario(explicit: str | None, default_scenario: str | None) -> Scen
                          "scenarios": names})
 
 
-def _match_route(scenario: Scenario, method: str, path: str) -> tuple[Route, dict[str, str]]:
+# ---------------------------------------------------------------------------
+# 路由匹配与规则判定（真实请求与预演共用；预演时额外产出判定轨迹）
+# ---------------------------------------------------------------------------
+
+def _match_routes(scenario: Scenario, method: str, path: str) -> tuple[
+        Route, dict[str, str], list[dict[str, Any]]]:
+    """返回 (命中路由, 路径参数, 路由判定轨迹)。"""
+    trace: list[dict[str, Any]] = []
     candidates: list[tuple[Route, dict[str, str]]] = []
     for route in scenario.routes:
         params = match_path(route.path_re, path)
         if params is not None:
             candidates.append((route, params))
+            trace.append({
+                "stage": "route",
+                "route": route.id,
+                "path": route.path,
+                "methods": route.methods,
+                "path_match": True,
+                "path_params": params,
+                "method_match": method in route.methods,
+            })
+
     if not candidates:
-        raise SimAbort(404, {"error": "no_route", "path": path})
+        raise SimAbort(404, {"error": "no_route", "path": path}, trace=trace)
 
     method_matches = [c for c in candidates if method in c[0].methods]
     if not method_matches:
         allowed = sorted({m for r, _ in candidates for m in r.methods})
-        raise SimAbort(405, {"error": "method_not_allowed", "allowed": allowed})
+        raise SimAbort(405, {"error": "method_not_allowed", "allowed": allowed},
+                       trace=trace)
 
-    return method_matches[0]
+    trace.append({"stage": "route_selected", "route": method_matches[0][0].id})
+    return method_matches[0][0], method_matches[0][1], trace
 
 
-def _evaluate_rules(rule_list: list[Rule], bag: dict[str, Any]) -> Rule | None:
+def _condition_trace(cond, bag: dict[str, Any]) -> dict[str, Any]:
+    present, actual = get_condition_value(cond.source, cond.path, bag)
+    try:
+        passed = evaluate_condition(cond, actual, present)
+        error = None
+    except ValueError as exc:  # 未知运算符等，载入时已校验，这里仅兜底
+        passed = False
+        error = str(exc)
+    return {
+        "source": cond.source,
+        "path": cond.path,
+        "op": cond.op,
+        "expected": cond.value,
+        "present": present,
+        "actual": actual,
+        "passed": passed,
+        **({"error": error} if error else {}),
+    }
+
+
+def evaluate_rules_traced(rule_list: list[Rule], bag: dict[str, Any]) -> tuple[
+        Rule | None, list[dict[str, Any]]]:
+    """按 priority 降序逐条判定规则，返回 (命中规则或 None, 逐条件轨迹)。
+
+    与真实引擎的短路语义完全一致：某规则首个失败条件之后的条件不再判定。
+    """
+    trace: list[dict[str, Any]] = []
+    matched = False
     for rule in rule_list:  # 已按 priority 降序排序
-        for cond in rule.conditions:
-            present, actual = get_condition_value(cond.source, cond.path, bag)
-            if not evaluate_condition(cond, actual, present):
-                break
-        else:
-            return rule
-    return None
+        entry: dict[str, Any] = {
+            "stage": "rule",
+            "rule": rule.name,
+            "priority": rule.priority,
+            "matched": False,
+            "conditions": [],
+        }
+        if matched:
+            # 已有更高优先级规则命中：真实引擎同样不会再看后续规则
+            entry["skipped"] = True
+            trace.append(entry)
+            continue
 
+        conditions_ok = True
+        for cond in rule.conditions:
+            cond_trace = _condition_trace(cond, bag)
+            entry["conditions"].append(cond_trace)
+            if not cond_trace["passed"]:
+                conditions_ok = False
+                break  # 与真实引擎一致：首个不满足条件即短路
+        entry["matched"] = conditions_ok
+        trace.append(entry)
+        if conditions_ok:
+            matched = True
+
+    hit = next((r for r, e in zip(rule_list, trace)
+                if not e.get("skipped") and e["matched"]), None)
+    return hit, trace
+
+
+# ---------------------------------------------------------------------------
+# 响应渲染与状态推进规划（不触碰数据库；真实/预演共用）
+# ---------------------------------------------------------------------------
 
 def _render_response(rule: Rule, renderer: Renderer) -> tuple[int, dict[str, str], Any, bool]:
     spec = rule.response
@@ -134,8 +213,110 @@ def _render_response(rule: Rule, renderer: Renderer) -> tuple[int, dict[str, str
     return status, headers, body, is_json
 
 
+@dataclass
+class _Planned:
+    """命中规则后的渲染结果与拟推进状态——尚未持久化。"""
+    scenario_name: str
+    route: Route
+    rule: Rule
+    path_params: dict[str, str]
+    status_code: int
+    headers: dict[str, str]
+    body: Any
+    is_json: bool
+    delay_ms: int
+    state: str
+    next_state: str
+    context: dict[str, Any]
+    new_context: dict[str, Any]
+    counters: dict[str, int]
+    seq_calls: list[dict[str, Any]]
+    trace: list[dict[str, Any]]
+
+
+def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
+                  path_params: dict[str, str], rule: Rule, *, state: str,
+                  context: dict[str, Any], method: str, path: str,
+                  body: Any, query: dict[str, Any], headers: dict[str, Any],
+                  trace: list[dict[str, Any]]) -> _Planned:
+    render_ctx = dict(context)
+    render_ctx.update({
+        "state": state,
+        "body": body,
+        "query": query,
+        "header": headers,
+        "path": path_params,
+        "request": {"method": method, "path": path, "route": route.id},
+        "context": dict(context),
+    })
+    # 预演（preview=True）时记录 seq() 调用；计数器在任何情况下都只存于本实例
+    renderer = Renderer(render_ctx, trace_calls=True)
+
+    try:
+        status, resp_headers, resp_body, is_json = _render_response(rule, renderer)
+        updates = renderer.render_value(rule.set) if rule.set else {}
+        next_state = state
+        if rule.next_state is not None:
+            next_state = renderer.render_template(rule.next_state).strip()
+            if next_state not in scenario.states:
+                raise SimAbort(500, {"error": "render_error",
+                                     "detail": f"规则 {rule.name} 渲染后的状态 {next_state!r} 未声明"})
+    except RenderError as exc:
+        raise SimAbort(500, {"error": "render_error",
+                             "rule": rule.name, "detail": str(exc)},
+                        trace=trace) from exc
+
+    if not isinstance(updates, dict):
+        raise SimAbort(500, {"error": "render_error",
+                             "detail": f"规则 {rule.name} 的 set 渲染结果必须是对象"},
+                       trace=trace)
+
+    new_context = dict(context)
+    new_context.update(updates)
+    new_context["_seq"] = renderer.counters
+
+    return _Planned(
+        scenario_name=scenario_name,
+        route=route,
+        rule=rule,
+        path_params=path_params,
+        status_code=status,
+        headers=resp_headers,
+        body=resp_body,
+        is_json=is_json,
+        delay_ms=rule.delay_ms,
+        state=state,
+        next_state=next_state,
+        context=context,
+        new_context=new_context,
+        counters=dict(renderer.counters),
+        seq_calls=list(renderer.seq_calls),
+        trace=trace,
+    )
+
+
+def _resolve_snapshot(conn, token: str, explicit_scenario: str | None,
+                      default_scenario: str | None) -> tuple[
+                          Scenario, str, str, dict[str, Any], bool]:
+    """解析会话快照；不存在时按真实请求的规则懒创建（仅真实写路径会落库）。"""
+    row = conn.execute(
+        "SELECT scenario, state, context FROM sessions WHERE token = ?",
+        (token,),
+    ).fetchone()
+
+    if row is not None:
+        scenario_name = row["scenario"]
+        scenario = store.get(scenario_name)
+        if scenario is None:
+            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
+        return scenario, scenario_name, row["state"], json.loads(row["context"]), False
+
+    scenario = _select_scenario(explicit_scenario, default_scenario)
+    return scenario, scenario.name, scenario.initial_state, {}, True
+
+
 # ---------------------------------------------------------------------------
-# 主入口
+# 真实请求主入口
 # ---------------------------------------------------------------------------
 
 async def simulate(request, default_scenario: str | None = None) -> SimResult:
@@ -161,29 +342,12 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
 
 def _run_locked(conn, token, method, path, query, headers, body,
                 default_scenario, explicit_scenario) -> SimResult:
-    # 1) 查找会话与场景
-    row = conn.execute(
-        "SELECT scenario, state, context FROM sessions WHERE token = ?",
-        (token,),
-    ).fetchone()
-
-    if row is not None:
-        scenario_name = row["scenario"]
-        scenario = store.get(scenario_name)
-        if scenario is None:
-            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
-        state = row["state"]
-        context = json.loads(row["context"])
-        is_new_session = False
-    else:
-        scenario = _select_scenario(explicit_scenario, default_scenario)
-        scenario_name = scenario.name
-        state = scenario.initial_state
-        context = {}
-        is_new_session = True
+    # 1) 查找会话与场景（不存在则按懒创建规则选场景，暂不落库）
+    scenario, scenario_name, state, context, is_new_session = _resolve_snapshot(
+        conn, token, explicit_scenario, default_scenario)
 
     # 2) 匹配路由（不存在则回滚，不留下空会话）
-    route, path_params = _match_route(scenario, method, path)
+    route, path_params, _trace = _match_routes(scenario, method, path)
 
     # 3) 新会话落库
     if is_new_session:
@@ -199,7 +363,8 @@ def _run_locked(conn, token, method, path, query, headers, body,
     # 4) 选择最高优先级匹配规则
     bag = {"state": state, "body": body, "query": query,
            "header": headers, "path": path_params}
-    rule = _evaluate_rules(route.rules, bag)
+    rule, rule_trace = evaluate_rules_traced(route.rules, bag)
+    trace = _trace + rule_trace
 
     if rule is None:
         raise SimAbort(409, {
@@ -207,46 +372,16 @@ def _run_locked(conn, token, method, path, query, headers, body,
             "scenario": scenario_name,
             "route": route.id,
             "state": state,
-        }, commit_on_abort=True)
+        }, commit_on_abort=True, trace=trace)
 
     # 5) 渲染响应 + 推进状态（同一事务内）
-    render_ctx = dict(context)
-    render_ctx.update({
-        "state": state,
-        "body": body,
-        "query": query,
-        "header": headers,
-        "path": path_params,
-        "request": {"method": method, "path": path, "route": route.id},
-        "context": dict(context),
-    })
-    renderer = Renderer(render_ctx)
-
-    try:
-        status, resp_headers, resp_body, is_json = _render_response(rule, renderer)
-        updates = renderer.render_value(rule.set) if rule.set else {}
-    except RenderError as exc:
-        raise SimAbort(500, {"error": "render_error",
-                             "rule": rule.name, "detail": str(exc)}) from exc
-
-    if not isinstance(updates, dict):
-        raise SimAbort(500, {"error": "render_error",
-                             "detail": f"规则 {rule.name} 的 set 渲染结果必须是对象"})
-
-    new_context = dict(context)
-    new_context.update(updates)
-    new_context["_seq"] = renderer.counters
-
-    next_state = state
-    if rule.next_state is not None:
-        next_state = renderer.render_template(rule.next_state).strip()
-        if next_state not in scenario.states:
-            raise SimAbort(500, {"error": "render_error",
-                                 "detail": f"规则 {rule.name} 渲染后的状态 {next_state!r} 未声明"})
+    planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
+                            state=state, context=context, method=method, path=path,
+                            body=body, query=query, headers=headers, trace=trace)
 
     conn.execute(
         "UPDATE sessions SET state = ?, context = ?, updated_at = datetime('now') WHERE token = ?",
-        (next_state, dumps(new_context), token),
+        (planned.next_state, dumps(planned.new_context), token),
     )
     conn.execute(
         """
@@ -255,20 +390,137 @@ def _run_locked(conn, token, method, path, query, headers, body,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (token, scenario_name, method, path, route.id, rule.name,
-         state, next_state, status),
+         state, planned.next_state, planned.status_code),
     )
 
     return SimResult(
-        status_code=status,
-        headers=resp_headers,
-        body=resp_body,
-        delay_ms=rule.delay_ms,
-        is_json=is_json,
+        status_code=planned.status_code,
+        headers=planned.headers,
+        body=planned.body,
+        delay_ms=planned.delay_ms,
+        is_json=planned.is_json,
         matched={
             "scenario": scenario_name,
             "route": route.id,
             "rule": rule.name,
             "from_state": state,
-            "to_state": next_state,
+            "to_state": planned.next_state,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 请求预演：只读快照、同一份匹配/渲染逻辑、零持久化副作用
+# ---------------------------------------------------------------------------
+
+def _build_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """以 after 相对 before 的视角生成 added/changed/removed 差异（跳过 _seq）。"""
+    added: dict[str, Any] = {}
+    changed: dict[str, Any] = {}
+    removed: list[str] = []
+    keys = set(before) | set(after)
+    for key in keys:
+        if key == "_seq":
+            continue
+        if key not in before:
+            added[key] = after[key]
+        elif key not in after:
+            removed.append(key)
+        elif before[key] != after[key]:
+            changed[key] = {"before": before[key], "after": after[key]}
+    return {
+        "added": added,
+        "changed": changed,
+        "removed": sorted(removed),
+    }
+
+
+def preview_session(token: str, method: str, path: str, query: dict[str, Any],
+                    headers: dict[str, Any], body: Any,
+                    default_scenario: str | None) -> tuple[int, dict[str, Any]]:
+    """预演一次业务请求，返回 (HTTP 状态码, 结构化结果)。
+
+    预演要求会话已存在（不懒创建），全程只读；返回的状态码/错误体与真实
+    请求一致，命中时另外给出拟响应与 state/context 差异。
+    """
+    with read_tx() as conn:
+        row = conn.execute(
+            "SELECT scenario, state, context FROM sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            # 与真实请求不同：预演不创建会话，直接按管理接口语义报 404
+            return 404, {"error": "session_not_found", "token": token,
+                         "detail": "预演要求会话已存在；请先创建会话或发起一次真实业务请求",
+                         "preview": {"persisted": False}}
+
+        scenario_name = row["scenario"]
+        scenario = store.get(scenario_name)
+        if scenario is None:
+            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
+        state = row["state"]
+        context = json.loads(row["context"])
+
+        route, path_params, trace = _match_routes(scenario, method, path)
+
+        bag = {"state": state, "body": body, "query": query,
+               "header": headers, "path": path_params}
+        rule, rule_trace = evaluate_rules_traced(route.rules, bag)
+        trace += rule_trace
+
+        if rule is None:
+            payload: dict[str, Any] = {
+                "error": "no_matching_rule",
+                "scenario": scenario_name,
+                "route": route.id,
+                "state": state,
+                "trace": trace,
+                "preview": {"persisted": False},
+            }
+            return 409, payload
+
+        planned = _plan_matched(scenario, scenario_name, route, path_params, rule,
+                                state=state, context=context, method=method, path=path,
+                                body=body, query=query, headers=headers, trace=trace)
+
+    # 事务已回滚：以下全部是基于快照的拟结果
+    seq_before = {k: context.get("_seq", {}).get(k)
+                  for k in planned.counters if k in context.get("_seq", {})}
+    seq_preview = [
+        {
+            **call,
+            "before": seq_before.get(call["name"]),
+            "note": "仅预演内自增，不会持久化；随后真实请求仍从预演前的计数开始",
+        }
+        for call in planned.seq_calls
+    ]
+
+    payload = {
+        "preview": {"persisted": False},
+        "token": token,
+        "matched": {
+            "scenario": planned.scenario_name,
+            "route": planned.route.id,
+            "rule": planned.rule.name,
+            "path_params": planned.path_params,
+        },
+        "request": {
+            "method": method,
+            "path": path,
+            "query": query,
+            "headers": headers,
+            "body": body,
+        },
+        "response": {
+            "status_code": planned.status_code,
+            "headers": planned.headers,
+            "body": planned.body,
+            "delay_ms": planned.delay_ms,
+        },
+        "state_diff": {"before": planned.state, "after": planned.next_state,
+                       "changed": planned.state != planned.next_state},
+        "context_diff": _build_diff(planned.context, planned.new_context),
+        "seq_preview": seq_preview,
+        "trace": planned.trace,
+    }
+    return 200, payload

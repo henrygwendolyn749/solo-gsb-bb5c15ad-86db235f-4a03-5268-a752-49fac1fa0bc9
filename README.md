@@ -23,6 +23,7 @@ docker compose up --build -d
 | Swagger 文档 | <http://localhost:8080/docs> |
 | 场景管理 | `http://localhost:8080/__scenarios` |
 | 会话状态 | `http://localhost:8080/__sessions/{token}` |
+| 请求预演 | `POST http://localhost:8080/__sessions/{token}/preview` |
 | 模拟业务流量 | 除上述管理前缀外的任意路径，如 `POST http://localhost:8080/orders` |
 
 停止：`docker compose down`（数据保留在命名卷 `simulator-data` 中；加 `-v` 一并清除）。
@@ -179,12 +180,89 @@ curl -s -X PUT $BASE/__scenarios/my-scenario \
 | POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略 |
 | GET | `/__sessions/{token}` | **会话状态查询**：当前状态、上下文、可用状态、路由列表 |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧） |
+| POST | `/__sessions/{token}/preview` | **请求预演**：不落库地模拟一次业务请求，返回命中结果、拟响应与 state/context 差异 |
 | POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件 |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
 
 会话也可以**懒创建**：业务请求只需携带令牌；首个匹配到路由的请求自动建会话。
 当已载入多个场景时，懒创建需通过请求头 `sim-scenario: <name>` 指定场景
 （或设置环境变量 `SIM_DEFAULT_SCENARIO`）。
+
+### 请求预演（preview）
+
+`POST /__sessions/{token}/preview` 基于该会话的**当前快照**模拟一次业务请求：
+复用与真实请求完全相同的路由匹配、条件判断与 Jinja2 模板渲染代码，但在
+**只读事务**中执行并整体回滚——不创建/更新会话、不写事件、不推进状态，
+即使模板调用了 `seq()`，随后的真实请求仍会拿到**预演前**的计数值。
+
+请求体（JSON）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `method` | 拟使用的 HTTP 方法（必填） |
+| `path` | 拟请求的业务路径，如 `/orders/42/pay`（必填，`/` 开头） |
+| `query` | 查询参数对象；值支持标量或标量数组（数组与真实 queryParams 一样取最后一个） |
+| `headers` | 请求头对象（键名自动转小写，值为标量） |
+| `body` | 请求体（任意 JSON；省略视为空对象） |
+
+**外层 HTTP 状态码与真实请求完全一致**；响应体含命中信息、拟响应与差异：
+
+```bash
+BASE=http://localhost:8080
+curl -s -X POST $BASE/__sessions/t1/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"POST","path":"/orders/42/pay","body":{"channel":"alipay"}}'
+```
+
+```jsonc
+{
+  "outcome": "matched",
+  "request": { "method": "POST", "path": "/orders/42/pay", "query": {}, "headers": {}, "body": {"channel": "alipay"} },
+  "snapshot": { "token": "t1", "scenario": "order-flow", "state": "created", "context": {"sku": "A-1"} },
+  "matched": { "scenario": "order-flow", "route": "pay-order", "rule": "pay-created",
+               "path_params": {"order_id": "42"} },
+  "response": { "status": 200, "headers": {}, "delay_ms": 0,
+                "body": { "order_id": "42", "paid": true, "channel": "alipay", "paid_at": "...", "trace": "..." } },
+  "state_diff":   { "from": "created", "to": "paid", "changed": true },
+  "context_diff": { "set": {"pay_channel": "alipay"},
+                    "before": {"sku": "A-1"},
+                    "would_be_after": {"sku": "A-1", "pay_channel": "alipay"} },
+  "seq": {},  // 模板若调用 seq()，这里列出每个计数器的 before/模板返回值/拟落库值（persisted:false）
+  "trace": {   // 逐规则、逐条件的判定轨迹（priority 降序；命中之后的规则标记 skipped）
+    "scenario": "order-flow", "route": "pay-order",
+    "rules": [
+      { "rule": "pay-created", "priority": 100, "selected": true, "matched": true, "skipped": false,
+        "conditions": [
+          { "source": "state", "path": "", "op": "eq", "expected": "created", "present": true, "actual": "created", "passed": true },
+          { "source": "body", "path": "channel", "op": "in", "expected": ["alipay","wechat","card"], "present": true, "actual": "alipay", "passed": true }
+        ] },
+      { "rule": "double-pay-rejected", "priority": 50, "selected": false, "matched": false, "skipped": true, "conditions": [] },
+      { "rule": "bad-channel", "priority": 10, "selected": false, "matched": false, "skipped": true, "conditions": [] }
+    ]
+  },
+  "persisted": false
+}
+```
+
+`seq()` 的无副作用示例（模板 `{{ seq('order', 1000) }}`）：
+
+```bash
+# 连续预演任意次，order_id 恒为 1000
+for i in 1 2; do
+  curl -s -X POST $BASE/__sessions/t1/preview -H 'Content-Type: application/json' \
+    -d '{"method":"POST","path":"/orders","body":{"sku":"X","quantity":1}}'
+done
+# 随后的真实请求仍然从 1000 开始
+curl -s -X POST $BASE/orders -H 'sim-session-token: t1' \
+  -H 'Content-Type: application/json' -d '{"sku":"X","quantity":1}'
+# -> {"order_id": 1000, ...}
+```
+
+未命中时（`no_matching_rule` / `no_route` / `method_not_allowed` /
+`render_error` 等），预演返回**与真实请求相同的状态码和错误体**，并额外附上
+`trace`（规则与逐条件判定，含左值是否存在、实际值、比较结果）、
+`snapshot` 与 `request`，便于定位为何没命中；会话不存在返回 `404 session_not_found`。
+预演不会懒创建会话。
 
 ### 业务请求约定
 
@@ -245,16 +323,16 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 ├── app/
 │   ├── main.py            # FastAPI 入口、生命周期初始化、全路径转发
 │   ├── config.py          # 环境变量配置
-│   ├── db.py              # 连接/WAL/建表/IMMEDIATE 事务与锁重试
+│   ├── db.py              # 连接/WAL/建表/IMMEDIATE 事务与锁重试（含预演用只读快照事务）
 │   ├── scenario.py        # YAML 解析与校验
 │   ├── models.py          # 场景/路由/规则数据模型
-│   ├── matching.py        # 路径模式、点路径取值、条件运算符
+│   ├── matching.py        # 路径模式、点路径取值、条件运算符（含逐条件判定轨迹）
 │   ├── renderer.py        # Jinja2 沙箱渲染与模板函数
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移
+│   ├── engine.py          # 核心：匹配→渲染→迁移（真实请求与 preview 共用同一纯计算路径）
 │   ├── store.py           # 已编译场景缓存
 │   └── routers/
 │       ├── scenarios.py   # 场景校验/载入/查询/删除
-│       └── sessions.py    # 会话创建/状态查询/重置/事件
+│       └── sessions.py    # 会话创建/状态查询/重置/事件/请求预演
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
 ├── requirements.txt

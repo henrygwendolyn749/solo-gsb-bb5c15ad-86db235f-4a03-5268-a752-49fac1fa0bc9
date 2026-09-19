@@ -94,6 +94,22 @@ class WriteLocked(sqlite3.OperationalError):
 
 
 @contextmanager
+def read_tx() -> Iterator[sqlite3.Connection]:
+    """打开只读快照事务（deferred）。
+
+    WAL 模式下读事务在首条语句时建立一致性快照，不阻塞并发写者，
+    也看不到事务开始后的新提交。退出时一律 ROLLBACK —— 预演等场景
+    借此保证「基于同一会话快照且全程无持久化副作用」。
+    """
+    conn = get_conn()
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.execute("ROLLBACK")
+
+
+@contextmanager
 def write_tx(retries: int | None = None) -> Iterator[sqlite3.Connection]:
     """打开一个 IMMEDIATE 写事务，锁冲突时重试。
 

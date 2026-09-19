@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .models import Condition
+from .models import Condition, Rule
 
 # ---------------------------------------------------------------------------
 # 路径模式：/orders/{id}/items/{item_id}
@@ -159,3 +159,53 @@ def get_condition_value(source: str, cond_path: str, bag: dict[str, Any]) -> tup
         return True, bag.get("state")
     container = bag.get(source, {})
     return resolve(container, cond_path)
+
+
+def evaluate_rules_traced(rule_list: list[Rule], bag: dict[str, Any]) -> tuple[Rule | None, list[dict[str, Any]]]:
+    """与引擎规则选择语义一致（priority 降序、首条全部满足即命中），
+    但始终产出每条规则、每个条件的判定轨迹，供预演接口使用。
+
+    返回 (命中的 Rule 或 None, 轨迹列表)。命中规则之后的规则标记
+    ``selected: false``（真实匹配在此短路，不会继续评估）。
+    """
+    trace: list[dict[str, Any]] = []
+    matched = None
+    for rule in rule_list:  # 已按 priority 降序排序
+        conditions: list[dict[str, Any]] = []
+        all_passed = True
+        if matched is not None:
+            trace.append({
+                "rule": rule.name,
+                "priority": rule.priority,
+                "selected": False,
+                "matched": False,
+                "skipped": True,
+                "conditions": conditions,
+            })
+            continue
+        for cond in rule.conditions:
+            present, actual = get_condition_value(cond.source, cond.path, bag)
+            passed = bool(evaluate_condition(cond, actual, present))
+            conditions.append({
+                "source": cond.source,
+                "path": cond.path,
+                "op": cond.op,
+                "expected": None if cond.op in {"exists", "truthy"} else cond.value,
+                "present": present,
+                "actual": actual,
+                "passed": passed,
+            })
+            if not passed:
+                all_passed = False
+                break
+        if all_passed:
+            matched = rule
+        trace.append({
+            "rule": rule.name,
+            "priority": rule.priority,
+            "selected": all_passed and matched is rule,
+            "matched": all_passed,
+            "skipped": False,
+            "conditions": conditions,
+        })
+    return matched, trace

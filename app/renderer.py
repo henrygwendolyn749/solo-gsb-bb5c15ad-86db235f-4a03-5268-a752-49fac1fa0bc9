@@ -43,6 +43,8 @@ class Renderer:
     def __init__(self, context: dict[str, Any]):
         self.context = dict(context)
         self.counters: dict[str, int] = dict(self.context.get("_seq") or {})
+        # 本次渲染实际调用过的 seq：{name: 首次返回值}
+        self.seq_calls: dict[str, int] = {}
 
         self.env = SandboxedEnvironment(
             undefined=StrictUndefined,
@@ -63,6 +65,7 @@ class Renderer:
             self.counters[name] = start
         value = self.counters[name]
         self.counters[name] += 1
+        self.seq_calls.setdefault(name, value)
         return value
 
     # -- 公开方法 --------------------------------------------------------

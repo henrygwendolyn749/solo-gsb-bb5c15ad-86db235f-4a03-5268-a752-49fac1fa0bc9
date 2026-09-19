@@ -1,18 +1,23 @@
-"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史。"""
+"""会话管理接口：创建 / 查询状态 / 重置 / 事件历史 / 请求预演。"""
 from __future__ import annotations
 
 import json
 import secrets
 import sqlite3
+from typing import Any
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from ..config import settings
 from ..db import dumps, get_conn, write_tx
+from ..engine import preview
 from ..store import store
 
 router = APIRouter(prefix="/__sessions", tags=["sessions"])
+
+_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
 
 class CreateSessionBody(BaseModel):
@@ -116,6 +121,97 @@ async def list_events(token: str, limit: int = 50) -> JSONResponse:
         (token, limit),
     ).fetchall()
     return JSONResponse({"token": token, "events": [dict(r) for r in rows]})
+
+
+# ---------------------------------------------------------------------------
+# 请求预演：POST /__sessions/{token}/preview
+# ---------------------------------------------------------------------------
+
+_SCALAR_TYPES = (str, int, float, bool)
+
+
+class PreviewBody(BaseModel):
+    method: str = Field(description="拟使用的 HTTP 方法")
+    path: str = Field(description="拟请求的业务路径，如 /orders/42/pay")
+    query: dict[str, Any] = Field(
+        default_factory=dict,
+        description="查询参数；值支持标量或标量数组（数组与真实 queryParams 一样取最后一个）",
+    )
+    headers: dict[str, Any] = Field(default_factory=dict, description="请求头（键名自动转小写）")
+    body: Any = Field(default=None, description="请求体（JSON 对象/数组/标量，省略视为空对象）")
+
+    @field_validator("method")
+    @classmethod
+    def _method_allowed(cls, value: str) -> str:
+        method = str(value).upper()
+        if method not in _ALLOWED_METHODS:
+            raise ValueError(f"不支持的 HTTP 方法: {value!r}")
+        return method
+
+    @field_validator("path")
+    @classmethod
+    def _path_valid(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.startswith("/"):
+            raise ValueError("path 必须是以 / 开头的字符串")
+        return value
+
+
+class PreviewValidationError(ValueError):
+    """预演请求体字段无法规整成真实请求形态。"""
+
+
+def _normalize_scalar_map(raw: dict[str, Any], label: str) -> dict[str, str]:
+    """把预演输入中的 query/headers 规整成真实请求的形态：键字符串、值字符串。
+
+    query 的数组值与 Starlette ``query_params[key]`` 一致（取最后一个）；
+    headers 只允许标量。``sim_session_token`` 不出现在真实业务 query 中，剔除。
+    """
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise PreviewValidationError(f"{label} 的键必须是字符串: {key!r}")
+        if label == "query" and key == "sim_session_token":
+            continue
+        if isinstance(value, list):
+            if label != "query" or not value:
+                raise PreviewValidationError(f"{label}.{key} 不支持数组值")
+            value = value[-1]
+        if not isinstance(value, _SCALAR_TYPES):
+            allowed = "标量（字符串/数字/布尔）或标量数组" if label == "query" \
+                else "标量（字符串/数字/布尔）"
+            raise PreviewValidationError(f"{label}.{key} 的值必须是{allowed}")
+        out[key.lower() if label == "header" else key] = str(value)
+    return out
+
+
+def _bad_preview(detail: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": "invalid_preview_request",
+                                                  "detail": detail})
+
+
+@router.post("/{token}/preview")
+async def preview_request(token: str, body: PreviewBody) -> JSONResponse:
+    """基于当前会话快照预演一次业务请求：复用真实路由匹配、条件判断与模板渲染，
+    但不写库、不推进状态、不递增 seq 计数器（外层 HTTP 状态码与真实请求一致）。"""
+    try:
+        query = _normalize_scalar_map(body.query, "query")
+        headers = _normalize_scalar_map(body.headers, "header")
+    except PreviewValidationError as exc:
+        return _bad_preview(str(exc))
+
+    parsed_body: Any = {} if body.body is None else body.body
+
+    status_code, envelope = preview(
+        token=token,
+        method=body.method,
+        path=body.path,
+        query=query,
+        headers=headers,
+        body=parsed_body,
+        default_scenario=settings.default_scenario,
+        explicit_scenario=headers.get("sim-scenario"),
+    )
+    return JSONResponse(status_code=status_code, content=envelope)
 
 
 class ResetBody(BaseModel):
